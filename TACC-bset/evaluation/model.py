@@ -1,0 +1,2554 @@
+"""PCVRHyFormer: A hybrid transformer model for post-click conversion rate prediction."""
+
+import logging
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, NamedTuple, Tuple, Optional, Union
+
+
+class ModelInput(NamedTuple):
+    user_int_feats: torch.Tensor
+    item_int_feats: torch.Tensor
+    user_dense_feats: torch.Tensor
+    item_dense_feats: torch.Tensor
+    seq_data: dict        # {domain: tensor [B, S, L]}
+    seq_lens: dict        # {domain: tensor [B]}
+    seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_time_stats: dict  # {domain: tensor [B, F]}
+    timestamp_weekday: torch.Tensor  # (B,)
+    timestamp_hour: torch.Tensor     # (B,)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Rotary Position Embedding (RoPE)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class RotaryEmbedding(nn.Module):
+    """Precomputes and caches RoPE cos/sin values.
+
+    Attributes:
+        dim: Rotary embedding dimension.
+        max_seq_len: Maximum sequence length for cache.
+        base: Base frequency for rotary encoding.
+    """
+
+    def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0) -> None:
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
+        # Precompute inv_freq: (dim // 2,)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+
+        # Precompute cache
+        self._build_cache(max_seq_len)
+
+    def _build_cache(self, seq_len: int) -> None:
+        t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
+        freqs = torch.outer(t, self.inv_freq)  # (seq_len, dim // 2)
+        emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, dim)
+        self.register_buffer('cos_cached', emb.cos().unsqueeze(0), persistent=False)  # (1, seq_len, dim)
+        self.register_buffer('sin_cached', emb.sin().unsqueeze(0), persistent=False)  # (1, seq_len, dim)
+
+    def forward(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Computes cos/sin values for the given sequence length.
+
+        Returns pre-computed slices from the cache. The cache is built once
+        in __init__ with max_seq_len; no runtime expansion is performed so
+        that the forward pass remains compatible with torch.compile().
+        """
+        cos = self.cos_cached[:, :seq_len, :].to(device)
+        sin = self.sin_cached[:, :seq_len, :].to(device)
+        return cos, sin
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Swaps and negates the first and second halves of the last dimension."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def apply_rope_to_tensor(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Applies Rotary Position Embedding to a single tensor.
+
+    Args:
+        x: (B, num_heads, L, head_dim)
+        cos: (1, L_max, head_dim) or (B, L, head_dim) for batch-specific positions.
+        sin: Same shape as cos.
+
+    Returns:
+        Rotated tensor of shape (B, num_heads, L, head_dim).
+    """
+    L = x.shape[2]
+    cos_ = cos[:, :L, :].unsqueeze(1)  # (*, 1, L, head_dim)
+    sin_ = sin[:, :L, :].unsqueeze(1)
+    return x * cos_ + rotate_half(x) * sin_
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HyFormer Basic Components
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU activation: x1 * SiLU(x2)."""
+
+    def __init__(self, d_model: int, hidden_mult: int = 4) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        self.fc = nn.Linear(d_model, 2 * hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc(x)
+        x1, x2 = x.chunk(2, dim=-1)
+        x = x1 * F.silu(x2)
+        x = self.fc_out(x)
+        return x
+
+
+class RoPEMultiheadAttention(nn.Module):
+    """Multi-head attention with Rotary Position Embedding support.
+
+    Manually projects Q/K/V and reshapes for multi-head, then injects RoPE
+    after projection and before dot-product. Uses F.scaled_dot_product_attention
+    for efficient computation.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        rope_on_q: bool = True,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.rope_on_q = rope_on_q
+        self.dropout = dropout
+
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+        self.W_g = nn.Linear(d_model, d_model)
+
+        nn.init.zeros_(self.W_g.weight)
+        nn.init.constant_(self.W_g.bias, 1.0)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+        q_rope_cos: Optional[torch.Tensor] = None,
+        q_rope_sin: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+    ) -> tuple:
+        """Computes multi-head attention with optional RoPE.
+
+        Args:
+            query: (B, Lq, D)
+            key: (B, Lk, D)
+            value: (B, Lk, D)
+            key_padding_mask: (B, Lk), True indicates padding positions.
+            attn_mask: (Lq, Lk) or (B*num_heads, Lq, Lk), additive mask.
+            rope_cos: (1, L, head_dim), RoPE for KV side (also used for Q
+                unless q_rope_* is provided).
+            rope_sin: Same shape as rope_cos.
+            q_rope_cos: (B, Lq, head_dim) or (1, Lq, head_dim), Q-specific
+                RoPE for cross-attention with gathered positions.
+            q_rope_sin: Same shape as q_rope_cos.
+            need_weights: Compatibility parameter, not used.
+
+        Returns:
+            Tuple of (output, None).
+        """
+        B, Lq, _ = query.shape
+        Lk = key.shape[1]
+
+        # 1. Linear projection
+        Q = self.W_q(query)  # (B, Lq, D)
+        K = self.W_k(key)    # (B, Lk, D)
+        V = self.W_v(value)  # (B, Lk, D)
+
+        # 2. Reshape to (B, num_heads, L, head_dim)
+        Q = Q.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # 3. Apply RoPE independently to Q and K
+        if rope_cos is not None and rope_sin is not None:
+            # K always uses rope_cos/rope_sin (KV-side positional encoding)
+            K = apply_rope_to_tensor(K, rope_cos, rope_sin)
+
+            if self.rope_on_q:
+                # Q side: prefer dedicated q_rope_cos/sin (top_k positions in LongerEncoder cross-attn)
+                q_cos = q_rope_cos if q_rope_cos is not None else rope_cos
+                q_sin = q_rope_sin if q_rope_sin is not None else rope_sin
+                Q = apply_rope_to_tensor(Q, q_cos, q_sin)
+
+        # 4. Convert key_padding_mask to SDPA format
+        sdpa_attn_mask = None
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, Lk), True = padding
+            # SDPA expects (B, 1, 1, Lk) bool mask, True = attend
+            sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
+            sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
+
+        if attn_mask is not None:
+            # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
+            # Convert to bool: positions that are not -inf are True
+            bool_attn = (attn_mask == 0)  # (Lq, Lk)
+            bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
+            if sdpa_attn_mask is not None:
+                sdpa_attn_mask = sdpa_attn_mask & bool_attn
+            else:
+                sdpa_attn_mask = bool_attn
+
+        # 5. Scaled Dot-Product Attention
+        dropout_p = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            Q, K, V,
+            attn_mask=sdpa_attn_mask,
+            dropout_p=dropout_p,
+        )  # (B, num_heads, Lq, head_dim)
+
+        # Replace NaN from all-padding softmax with 0 (zero vectors preserve original input via residual)
+        out = torch.nan_to_num(out, nan=0.0)
+
+        # 6. Reshape back and output projection
+        out = out.transpose(1, 2).contiguous().view(B, Lq, self.d_model)
+        G = self.W_g(query)
+        out = out * torch.sigmoid(G)
+        out = self.W_o(out)
+
+        return out, None
+
+
+DenseEntry = Tuple[int, int, int]
+
+
+def _normalize_dense_entries(
+    dense_entries: Optional[List[DenseEntry]],
+    total_dim: int,
+    name: str,
+) -> List[DenseEntry]:
+    """Return offset-ordered dense entries that cover ``[0, total_dim)``."""
+    if total_dim <= 0:
+        return []
+
+    entries = [] if dense_entries is None else [
+        (int(fid), int(offset), int(length))
+        for fid, offset, length in dense_entries
+    ]
+    if not entries:
+        return [(0, 0, total_dim)]
+
+    entries = sorted(entries, key=lambda x: x[1])
+    normalized: List[DenseEntry] = []
+    covered_until = 0
+    synthetic_fid = -1000000
+
+    for fid, offset, length in entries:
+        if length <= 0:
+            raise ValueError(
+                f"{name} dense entry fid={fid} has non-positive length={length}"
+            )
+        if offset < covered_until:
+            raise ValueError(
+                f"{name} dense entries overlap around fid={fid}, offset={offset}"
+            )
+        if offset + length > total_dim:
+            raise ValueError(
+                f"{name} dense entry fid={fid} exceeds total_dim={total_dim}: "
+                f"offset={offset}, length={length}"
+            )
+        if offset > covered_until:
+            normalized.append((synthetic_fid, covered_until, offset - covered_until))
+            synthetic_fid -= 1
+        normalized.append((fid, offset, length))
+        covered_until = offset + length
+
+    if covered_until < total_dim:
+        normalized.append((synthetic_fid, covered_until, total_dim - covered_until))
+
+    return normalized
+
+
+class FieldAwareSingleDenseTokenizer(nn.Module):
+    """Project each dense fid independently, then pool fields into one token."""
+
+    def __init__(
+        self,
+        dense_entries: List[DenseEntry],
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.01,
+    ) -> None:
+        super().__init__()
+        if not dense_entries:
+            raise ValueError("FieldAwareSingleDenseTokenizer requires dense entries")
+
+        self.dense_entries = tuple(dense_entries)
+        self.d_model = d_model
+        self.num_fields = len(dense_entries)
+
+        self.field_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(length, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+            )
+            for _, _, length in self.dense_entries
+        ])
+        self.field_id_emb = nn.Parameter(
+            torch.randn(self.num_fields, d_model) * 0.02
+        )
+        self.query = nn.Parameter(torch.randn(1, d_model) * 0.02)
+
+        self.q_norm = nn.LayerNorm(d_model)
+        self.kv_norm = nn.LayerNorm(d_model)
+        self.attn = RoPEMultiheadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            rope_on_q=False,
+        )
+        self.out_norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, dense_feats: torch.Tensor) -> torch.Tensor:
+        field_tokens = []
+        for i, ((_, offset, length), proj) in enumerate(
+            zip(self.dense_entries, self.field_projs)
+        ):
+            segment = dense_feats[:, offset:offset + length]
+            token = proj(segment)
+            token = token + self.field_id_emb[i].view(1, -1)
+            field_tokens.append(token.unsqueeze(1))
+
+        field_tokens = torch.cat(field_tokens, dim=1)
+        B = dense_feats.shape[0]
+        query = self.query.unsqueeze(0).expand(B, 1, self.d_model)
+
+        kv = self.kv_norm(field_tokens)
+        attn_out, _ = self.attn(
+            query=self.q_norm(query),
+            key=kv,
+            value=kv,
+        )
+        return self.out_norm(query + self.dropout(attn_out))
+
+
+class CrossAttention(nn.Module):
+    """Cross-attention module.
+
+    Query comes from global tokens (Q tokens), Key/Value comes from sequence
+    tokens. Only applies RoPE to KV side (rope_on_q=False).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        ln_mode: str = 'pre'
+    ) -> None:
+        super().__init__()
+        self.ln_mode = ln_mode
+
+        self.attn = RoPEMultiheadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            rope_on_q=False,
+        )
+
+        if ln_mode in ['pre', 'post']:
+            self.norm_q = nn.LayerNorm(d_model)
+            self.norm_kv = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Computes cross-attention between query tokens and sequence tokens.
+
+        Args:
+            query: (B, Nq, D), query tokens.
+            key_value: (B, L, D), sequence tokens.
+            key_padding_mask: (B, L), True indicates padding positions.
+            rope_cos: (1, L, head_dim), KV-side RoPE cosine values.
+            rope_sin: (1, L, head_dim), KV-side RoPE sine values.
+
+        Returns:
+            Output tensor of shape (B, Nq, D).
+        """
+        residual = query
+
+        if self.ln_mode == 'pre':
+            query = self.norm_q(query)
+            key_value = self.norm_kv(key_value)
+
+        out, _ = self.attn(
+            query=query,
+            key=key_value,
+            value=key_value,
+            key_padding_mask=key_padding_mask,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+        )
+
+        out = residual + out
+
+        if self.ln_mode == 'post':
+            out = self.norm_q(out)
+
+        return out
+
+
+class RankMixerBlock(nn.Module):
+    """HyFormer Query Boosting block.
+
+    Performs three steps:
+    1. Token Mixing: Parameter-free tensor reshaping.
+    2. Per-token FFN: Shared-parameter feedforward network.
+    3. Residual connection: Q_boost = Q + Q_e.
+
+    Constraint: d_model must be divisible by n_total in 'full' mode.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_total: int,  # T = Nq + Nns
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+        mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
+    ) -> None:
+        super().__init__()
+        self.T = n_total
+        self.D = d_model
+        self.mode = mode
+
+        if mode == 'none':
+            # Pure identity mapping, no submodules created
+            return
+
+        if mode == 'full':
+            if d_model % n_total != 0:
+                raise ValueError(
+                    f"d_model={d_model} must be divisible by T={n_total} for token mixing."
+                )
+            self.d_sub = d_model // n_total
+
+        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
+        self.norm = nn.LayerNorm(d_model)
+        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
+        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
+        self.dropout = nn.Dropout(dropout)
+        # Post-LN after residual to stabilize stacked block outputs
+        self.post_norm = nn.LayerNorm(d_model)
+
+    def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
+        """Performs parameter-free token mixing via reshape and transpose.
+
+        Steps:
+        1. Splits channels into T subspaces: (B, T, D) -> (B, T, T, d_sub).
+        2. Swaps token and subspace axes: (B, token, h, d_sub) -> (B, h, token, d_sub).
+        3. Flattens back: (B, T, D).
+
+        Args:
+            Q: (B, T, D)
+
+        Returns:
+            Mixed tensor of shape (B, T, D).
+        """
+        B, T, D = Q.shape
+
+        # (B, T, D) -> (B, T, T, d_sub)
+        Q_split = Q.view(B, T, self.T, self.d_sub)
+
+        # (B, token, h, d_sub) -> (B, h, token, d_sub)
+        Q_rewired = Q_split.transpose(1, 2).contiguous()
+
+        # (B, T, T, d_sub) -> (B, T, D)
+        Q_hat = Q_rewired.view(B, T, D)
+        return Q_hat
+
+    def forward(self, Q: torch.Tensor) -> torch.Tensor:
+        """Applies query boosting: token mixing, FFN, and residual connection.
+
+        Args:
+            Q: (B, T, D) where T = Nq + Nns.
+
+        Returns:
+            Boosted tensor of shape (B, T, D).
+        """
+        if self.mode == 'none':
+            return Q
+
+        # Token Mixing (parameter-free rewire) or identity
+        if self.mode == 'full':
+            Q_hat = self.token_mixing(Q)
+        else:  # 'ffn_only'
+            Q_hat = Q
+
+        # Per-token FFN
+        x = self.norm(Q_hat)
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.dropout(x)
+        Q_e = self.fc2(x)
+
+        # Residual from original Q
+        Q_boost = Q + Q_e
+        Q_boost = self.post_norm(Q_boost)
+        return Q_boost
+
+
+class MultiSeqQueryGenerator(nn.Module):
+    """Multi-sequence query generation module.
+
+    Generates Q tokens independently for each sequence:
+    For each sequence i:
+        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+        Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_ns: int,
+        num_queries: int,
+        num_sequences: int,
+        hidden_mult: int = 4,
+        seq_time_stats_dim: int = 0,
+    ) -> None:
+        super().__init__()
+        self.num_queries = num_queries
+        self.num_sequences = num_sequences
+        self.d_model = d_model
+        self.seq_time_stats_dim = seq_time_stats_dim
+
+        global_info_dim = (num_ns + 1) * d_model
+
+        # LayerNorm on global_info to prevent gradient explosion from large-dim concat
+        self.global_info_norm = nn.LayerNorm(global_info_dim)
+
+        # Each sequence has N independent FFNs
+        self.query_ffns_per_seq = nn.ModuleList([
+            nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(global_info_dim, d_model * hidden_mult),
+                    nn.SiLU(),
+                    nn.Linear(d_model * hidden_mult, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                for _ in range(num_queries)
+            ])
+            for _ in range(num_sequences)
+        ])
+
+        if seq_time_stats_dim > 0:
+            self.seq_time_stats_proj = nn.Sequential(
+                nn.Linear(seq_time_stats_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.seq_time_stats_gate = nn.Linear(2 * d_model, d_model)
+        else:
+            self.seq_time_stats_proj = None
+            self.seq_time_stats_gate = None
+
+    def _time_stats_context(
+        self,
+        seq_time_stats_list: Optional[list],
+        domain_idx: int,
+    ) -> Optional[torch.Tensor]:
+        if self.seq_time_stats_proj is None or seq_time_stats_list is None:
+            return None
+        return self.seq_time_stats_proj(seq_time_stats_list[domain_idx].float())
+
+    def forward(
+        self,
+        ns_tokens: torch.Tensor,
+        seq_tokens_list: list,
+        seq_padding_masks: list,
+        seq_time_stats_list: Optional[list] = None,
+    ) -> list:
+        """Generates query tokens for each sequence.
+
+        Args:
+            ns_tokens: (B, M, D), shared NS tokens.
+            seq_tokens_list: List of (B, L_i, D) tensors, length S.
+            seq_padding_masks: List of (B, L_i) masks, length S. True
+                indicates padding.
+
+        Returns:
+            List of (B, Nq, D) query token tensors, length S.
+        """
+        B = ns_tokens.shape[0]
+        ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
+
+        q_tokens_list = []
+        for i in range(self.num_sequences):
+            # MeanPool(Seq_i)
+            valid_mask = ~seq_padding_masks[i]  # True = valid
+            valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
+            seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
+            seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
+            seq_pooled = seq_sum / seq_count  # (B, D)
+
+            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
+            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
+            global_info = self.global_info_norm(global_info)
+
+            # Generate N query tokens
+            queries = [ffn(global_info) for ffn in self.query_ffns_per_seq[i]]
+            q_tokens = torch.stack(queries, dim=1)  # (B, Nq, D)
+            time_context = self._time_stats_context(seq_time_stats_list, i)
+            if time_context is not None:
+                q_base = q_tokens.mean(dim=1)
+                gate = torch.sigmoid(
+                    self.seq_time_stats_gate(torch.cat([q_base, time_context], dim=-1))
+                )
+                q_tokens = q_tokens + (gate * time_context).unsqueeze(1)
+            q_tokens_list.append(q_tokens)
+
+        return q_tokens_list
+
+
+class UserItemAwareQueryGenerator(nn.Module):
+    """Target-aware query generator for CVR ablations.
+
+    This module fully replaces the baseline query-generation path. It uses
+    current item tokens to attend over user non-sequence tokens, then combines
+    that user-item context with each sequence domain's masked mean summary.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_queries: int,
+        num_sequences: int,
+        num_heads: int = 4,
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+        seq_time_stats_dim: int = 0,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_queries = num_queries
+        self.num_sequences = num_sequences
+        self.seq_time_stats_dim = seq_time_stats_dim
+
+        self.item_norm = nn.LayerNorm(d_model)
+        self.user_norm = nn.LayerNorm(d_model)
+        self.item_to_user_attn = RoPEMultiheadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            rope_on_q=False,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ui_post_norm = nn.LayerNorm(d_model)
+
+        fuse_dim = 4 * d_model
+        hidden_dim = hidden_mult * d_model
+        self.ui_fuse = nn.Sequential(
+            nn.Linear(fuse_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.seq_fuse = nn.Sequential(
+            nn.Linear(fuse_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        self.query_id_emb = nn.Parameter(torch.randn(num_queries, d_model) * 0.02)
+        self.domain_emb = nn.Parameter(torch.randn(num_sequences, d_model) * 0.02)
+        self.out_norm = nn.LayerNorm(d_model)
+        if seq_time_stats_dim > 0:
+            self.seq_time_stats_proj = nn.Sequential(
+                nn.Linear(seq_time_stats_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.seq_time_stats_gate = nn.Linear(2 * d_model, d_model)
+        else:
+            self.seq_time_stats_proj = None
+            self.seq_time_stats_gate = None
+
+    def _masked_mean(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        valid_mask = ~padding_mask
+        valid_mask_expanded = valid_mask.unsqueeze(-1).to(tokens.dtype)
+        token_sum = (tokens * valid_mask_expanded).sum(dim=1)
+        token_count = valid_mask_expanded.sum(dim=1).clamp(min=1)
+        return token_sum / token_count
+
+    def forward(
+        self,
+        user_tokens: torch.Tensor,
+        item_tokens: torch.Tensor,
+        seq_tokens_list: list,
+        seq_padding_masks: list,
+        seq_time_stats_list: Optional[list] = None,
+    ) -> list:
+        """Generate per-domain query tokens from user-item context.
+
+        Args:
+            user_tokens: (B, Nu, D), user-side non-sequence tokens.
+            item_tokens: (B, Ni, D), item-side non-sequence tokens.
+            seq_tokens_list: List of (B, L_i, D) sequence tokens.
+            seq_padding_masks: List of (B, L_i) masks, True indicates padding.
+
+        Returns:
+            List of (B, num_queries, D) tensors, one per sequence domain.
+        """
+        item_q = self.item_norm(item_tokens)
+        user_kv = self.user_norm(user_tokens)
+        attended_user, _ = self.item_to_user_attn(
+            query=item_q,
+            key=user_kv,
+            value=user_kv,
+        )
+        item_aware_tokens = self.ui_post_norm(
+            item_tokens + self.attn_dropout(attended_user)
+        )
+
+        item_repr = item_tokens.mean(dim=1)
+        user_given_item = item_aware_tokens.mean(dim=1)
+        ui_input = torch.cat(
+            [
+                item_repr,
+                user_given_item,
+                item_repr * user_given_item,
+                item_repr - user_given_item,
+            ],
+            dim=-1,
+        )
+        ui_base = self.ui_fuse(ui_input)
+
+        q_tokens_list = []
+        query_id_emb = self.query_id_emb.unsqueeze(0)
+        for domain_idx in range(self.num_sequences):
+            seq_pooled = self._masked_mean(
+                seq_tokens_list[domain_idx],
+                seq_padding_masks[domain_idx],
+            )
+            seq_input = torch.cat(
+                [
+                    ui_base,
+                    seq_pooled,
+                    ui_base * seq_pooled,
+                    ui_base - seq_pooled,
+                ],
+                dim=-1,
+            )
+            domain_base = self.seq_fuse(seq_input)
+            if self.seq_time_stats_proj is not None and seq_time_stats_list is not None:
+                time_context = self.seq_time_stats_proj(
+                    seq_time_stats_list[domain_idx].float())
+                gate = torch.sigmoid(
+                    self.seq_time_stats_gate(
+                        torch.cat([domain_base, time_context], dim=-1)
+                    )
+                )
+                domain_base = domain_base + gate * time_context
+            q_tokens = (
+                domain_base.unsqueeze(1)
+                + query_id_emb
+                + self.domain_emb[domain_idx].view(1, 1, self.d_model)
+            )
+            q_tokens_list.append(self.out_norm(q_tokens))
+
+        return q_tokens_list
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sequence Encoders
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class DINTargetAttention(nn.Module):
+    """DIN-style target attention over per-domain histories."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_sequences: int,
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_sequences = num_sequences
+
+        hidden_dim = hidden_mult * d_model
+        self.item_norm = nn.LayerNorm(d_model)
+        self.seq_norm = nn.LayerNorm(d_model)
+        self.score_mlp = nn.Sequential(
+            nn.Linear(4 * d_model, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.domain_emb = nn.Parameter(torch.randn(num_sequences, d_model) * 0.02)
+        self.out_proj = nn.Sequential(
+            nn.Linear(num_sequences * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(
+        self,
+        item_tokens: torch.Tensor,
+        seq_tokens_list: List[torch.Tensor],
+        seq_padding_masks: List[torch.Tensor],
+    ) -> torch.Tensor:
+        item_repr = self.item_norm(item_tokens.mean(dim=1))
+        contexts = []
+
+        for domain_idx in range(self.num_sequences):
+            seq_tokens = seq_tokens_list[domain_idx]
+            seq_mask = seq_padding_masks[domain_idx]
+            seq_repr = self.seq_norm(seq_tokens)
+
+            q = item_repr.unsqueeze(1).expand_as(seq_repr)
+            score_input = torch.cat(
+                [q, seq_repr, q * seq_repr, q - seq_repr],
+                dim=-1,
+            )
+            scores = self.score_mlp(score_input).squeeze(-1)
+            scores = scores.masked_fill(seq_mask, torch.finfo(scores.dtype).min)
+            attn = torch.softmax(scores, dim=-1)
+            attn = attn.masked_fill(seq_mask, 0.0)
+            attn = attn / attn.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
+            context = torch.bmm(attn.unsqueeze(1), seq_tokens).squeeze(1)
+            context = context + self.domain_emb[domain_idx].view(1, self.d_model)
+            contexts.append(context)
+
+        fused = torch.cat(contexts, dim=-1)
+        return self.out_proj(fused)
+
+
+class UserItemShortcutTower(nn.Module):
+    """Lightweight user-item interaction shortcut before the classifier.
+
+    The tower consumes already-tokenized user/item non-sequence tokens. It is
+    intentionally separate from query generation: HyFormer still models
+    sequences and final Q tokens, while this branch captures shallow user-item
+    matching evidence for the final prediction head.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int = 4,
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.user_norm = nn.LayerNorm(d_model)
+        self.item_norm = nn.LayerNorm(d_model)
+        self.user_to_item_attn = RoPEMultiheadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            rope_on_q=False,
+        )
+        self.item_to_user_attn = RoPEMultiheadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            rope_on_q=False,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.user_post_norm = nn.LayerNorm(d_model)
+        self.item_post_norm = nn.LayerNorm(d_model)
+
+        fuse_dim = 4 * d_model
+        hidden_dim = max(d_model, max(1, hidden_mult // 2) * d_model)
+        self.fuse = nn.Sequential(
+            nn.Linear(fuse_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(
+        self,
+        user_tokens: torch.Tensor,
+        item_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        user_q = self.user_norm(user_tokens)
+        item_kv = self.item_norm(item_tokens)
+        user_item_ctx, _ = self.user_to_item_attn(
+            query=user_q,
+            key=item_kv,
+            value=item_kv,
+        )
+        user_aware_item = self.user_post_norm(
+            user_tokens + self.attn_dropout(user_item_ctx)
+        )
+
+        item_q = self.item_norm(item_tokens)
+        user_kv = self.user_norm(user_tokens)
+        item_user_ctx, _ = self.item_to_user_attn(
+            query=item_q,
+            key=user_kv,
+            value=user_kv,
+        )
+        item_aware_user = self.item_post_norm(
+            item_tokens + self.attn_dropout(item_user_ctx)
+        )
+
+        user_repr = user_aware_item.mean(dim=1)
+        item_repr = item_aware_user.mean(dim=1)
+        fuse_input = torch.cat(
+            [
+                user_repr,
+                item_repr,
+                user_repr * item_repr,
+                user_repr - item_repr,
+            ],
+            dim=-1,
+        )
+        return self.fuse(fuse_input)
+
+
+class FirstDecodedQResidualBranch(nn.Module):
+    """Early decoded-query residual branch before classifier."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_queries: int,
+        num_sequences: int,
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+        mode: str = 'mixer',
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_queries = num_queries
+        self.num_sequences = num_sequences
+        self.T = num_queries * num_sequences
+        self.mode = mode
+
+        if mode == 'mixer':
+            self.mixer = RankMixerBlock(
+                d_model=d_model,
+                n_total=self.T,
+                hidden_mult=hidden_mult,
+                dropout=dropout,
+                mode='full',
+            )
+        elif mode == 'ffn_only':
+            self.mixer = RankMixerBlock(
+                d_model=d_model,
+                n_total=self.T,
+                hidden_mult=hidden_mult,
+                dropout=dropout,
+                mode='ffn_only',
+            )
+        elif mode == 'mlp':
+            self.mixer = nn.Identity()
+        else:
+            raise ValueError(f"Unknown first decoded shortcut mode: {mode}")
+
+        self.proj = nn.Sequential(
+            nn.LayerNorm(self.T * d_model),
+            nn.Linear(self.T * d_model, hidden_mult * d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_mult * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, decoded_qs: list) -> torch.Tensor:
+        # decoded_qs: list length S, each tensor [B, Nq, D]
+        x = torch.cat(decoded_qs, dim=1)
+        if x.shape[1] != self.T:
+            raise ValueError(
+                f"Expected decoded_q token count {self.T}, got {x.shape[1]}"
+            )
+
+        x = self.mixer(x)
+        x = x.reshape(x.shape[0], -1)
+        return self.proj(x)
+
+
+class SwiGLUEncoder(nn.Module):
+    """Efficient attention-free sequence encoder.
+
+    Structure: x + Dropout(SwiGLU(LN(x))).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        hidden_mult: int = 4,
+        dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.swiglu = SwiGLU(d_model, hidden_mult)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        """Applies the SwiGLU encoder with residual connection.
+
+        Args:
+            x: (B, L, D)
+            key_padding_mask: (B, L), True indicates padding. Not used by
+                this encoder variant.
+            **kwargs: Absorbs rope_cos/rope_sin and other unused parameters.
+
+        Returns:
+            Tuple of (output tensor of shape (B, L, D), key_padding_mask).
+        """
+        residual = x
+        x = self.norm(x)
+        x = self.swiglu(x)
+        x = self.dropout(x)
+        x = residual + x
+        return x, key_padding_mask
+
+
+class TransformerEncoder(nn.Module):
+    """High-capacity sequence encoder with self-attention and RoPE.
+
+    Structure: Standard Transformer Encoder Layer (Pre-LN).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        hidden_mult: int = 4,
+        dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        self.self_attn = RoPEMultiheadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            rope_on_q=True,
+        )
+
+        hidden_dim = d_model * hidden_mult
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout)
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Applies one Transformer encoder layer.
+
+        Args:
+            x: (B, L, D)
+            key_padding_mask: (B, L), True indicates padding positions.
+            rope_cos: (1, L, head_dim), RoPE cosine values.
+            rope_sin: (1, L, head_dim), RoPE sine values.
+
+        Returns:
+            Tuple of (output tensor of shape (B, L, D), key_padding_mask).
+        """
+        # Self-Attention (Pre-LN) with RoPE
+        residual = x
+        x = self.norm1(x)
+        x, _ = self.self_attn(
+            query=x,
+            key=x,
+            value=x,
+            key_padding_mask=key_padding_mask,
+            rope_cos=rope_cos,
+            rope_sin=rope_sin,
+        )
+        x = residual + x
+
+        # FFN (Pre-LN)
+        residual = x
+        x = self.norm2(x)
+        x = self.ffn(x)
+        x = residual + x
+
+        return x, key_padding_mask
+
+class LongerEncoder(nn.Module):
+    """Top-K compressed sequence encoder.
+
+    Adapts behavior based on input length:
+    - L > top_k (first MultiSeqHyFormerBlock): Cross Attention.
+      Q = latest top_k tokens, K/V = all seq tokens -> output (B, top_k, D).
+    - L <= top_k (subsequent MultiSeqHyFormerBlocks): Self Attention.
+      Q = K = V = top_k tokens -> output (B, top_k, D).
+
+    Causal mask is only applied among top_k tokens (self-attention layers);
+    the first cross-attention layer does not use a causal mask since Q and K
+    have different lengths.
+
+    Returns (output, new_key_padding_mask) so downstream can update the mask.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        top_k: int = 50,
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+        causal: bool = False
+    ) -> None:
+        super().__init__()
+        self.top_k = top_k
+        self.causal = causal
+
+        # Pre-LN for attention
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
+
+        # Shared RoPEMHA for both cross and self attention
+        self.attn = RoPEMultiheadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            rope_on_q=True,
+        )
+
+        # FFN (Pre-LN + residual)
+        self.ffn_norm = nn.LayerNorm(d_model)
+        hidden_dim = d_model * hidden_mult
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout)
+        )
+
+    def _gather_top_k(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Selects the latest top_k valid tokens from each sample.
+
+        Args:
+            x: (B, L, D)
+            key_padding_mask: (B, L), True indicates padding.
+
+        Returns:
+            top_k_tokens: (B, top_k, D)
+            new_padding_mask: (B, top_k), True indicates padding.
+            position_indices: (B, top_k), original position index for each
+                selected token, used for Q-side RoPE.
+        """
+        B, L, D = x.shape
+        device = x.device
+
+        # Valid lengths per sample
+        valid_len = (~key_padding_mask).sum(dim=1)  # (B,)
+
+        # Start position for each sample: max(valid_len - top_k, 0)
+        actual_k = torch.clamp(valid_len, max=self.top_k)  # (B,)
+        start_pos = valid_len - actual_k  # (B,)
+
+        # Build gather indices: (B, top_k)
+        offsets = torch.arange(self.top_k, device=device).unsqueeze(0).expand(B, -1)  # (B, top_k)
+        indices = start_pos.unsqueeze(1) + offsets  # (B, top_k)
+
+        # For samples with valid_len < top_k, early indices may exceed valid range;
+        # clamp to [0, L-1] and handle via mask below
+        indices = torch.clamp(indices, min=0, max=L - 1)
+
+        # Gather: (B, top_k, D)
+        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, D)  # (B, top_k, D)
+        top_k_tokens = torch.gather(x, dim=1, index=indices_expanded)
+
+        # New padding mask: first (top_k - actual_k) positions are padding
+        new_valid_len = actual_k  # (B,)
+        pad_count = self.top_k - new_valid_len  # (B,)
+        pos_indices = torch.arange(self.top_k, device=device).unsqueeze(0)  # (1, top_k)
+        new_padding_mask = pos_indices < pad_count.unsqueeze(1)  # (B, top_k)
+
+        # Zero out tokens at padding positions
+        top_k_tokens = top_k_tokens * (~new_padding_mask).unsqueeze(-1).float()
+
+        # position_indices for Q-side RoPE
+        position_indices = indices  # (B, top_k)
+
+        return top_k_tokens, new_padding_mask, position_indices
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Applies the LongerEncoder with adaptive cross/self attention.
+
+        Args:
+            x: (B, L, D), sequence tokens.
+            key_padding_mask: (B, L), True indicates padding.
+            rope_cos: (1, L, head_dim), RoPE cosine values (length must cover
+                original sequence length L).
+            rope_sin: (1, L, head_dim), RoPE sine values.
+
+        Returns:
+            output: (B, top_k, D), compressed sequence.
+            new_key_padding_mask: (B, top_k), updated padding mask.
+        """
+        B, L, D = x.shape
+
+        if L > self.top_k:
+            # === Cross Attention mode (first MultiSeqHyFormerBlock) ===
+            # 1. Extract latest top_k tokens as query
+            q, new_mask, q_pos_indices = self._gather_top_k(x, key_padding_mask)
+
+            # 2. Pre-LN
+            q_normed = self.norm_q(q)
+            kv_normed = self.norm_kv(x)
+
+            # 3. Build Q-side RoPE cos/sin by gathering from global cos/sin at top_k positions
+            q_rope_cos = None
+            q_rope_sin = None
+            if rope_cos is not None and rope_sin is not None:
+                # rope_cos: (1, L_max, head_dim), q_pos_indices: (B, top_k)
+                head_dim = rope_cos.shape[2]
+                # Expand to batch dimension
+                cos_expanded = rope_cos.expand(B, -1, -1)  # (B, L_max, head_dim)
+                sin_expanded = rope_sin.expand(B, -1, -1)
+                idx = q_pos_indices.unsqueeze(-1).expand(-1, -1, head_dim)  # (B, top_k, head_dim)
+                q_rope_cos = torch.gather(cos_expanded, 1, idx)  # (B, top_k, head_dim)
+                q_rope_sin = torch.gather(sin_expanded, 1, idx)
+
+            # 4. Cross Attention (no causal mask since Q and K have different lengths)
+            attn_out, _ = self.attn(
+                query=q_normed,
+                key=kv_normed,
+                value=kv_normed,
+                key_padding_mask=key_padding_mask,  # Original (B, L) mask
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+                q_rope_cos=q_rope_cos,
+                q_rope_sin=q_rope_sin,
+            )
+            out = q + attn_out  # Residual based on q
+        else:
+            # === Self Attention mode (subsequent MultiSeqHyFormerBlocks) ===
+            new_mask = key_padding_mask
+
+            # Pre-LN (Q and KV share norm_q)
+            x_normed = self.norm_q(x)
+
+            # Causal mask
+            attn_mask = None
+            if self.causal:
+                attn_mask = nn.Transformer.generate_square_subsequent_mask(
+                    L, device=x.device
+                )
+
+            attn_out, _ = self.attn(
+                query=x_normed,
+                key=x_normed,
+                value=x_normed,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                rope_cos=rope_cos,
+                rope_sin=rope_sin,
+            )
+            out = x + attn_out
+
+        # FFN (Pre-LN + residual)
+        residual = out
+        out = self.ffn_norm(out)
+        out = self.ffn(out)
+        out = residual + out
+
+        return out, new_mask
+
+
+def create_sequence_encoder(
+    encoder_type: str,
+    d_model: int,
+    num_heads: int = 4,
+    hidden_mult: int = 4,
+    dropout: float = 0.0,
+    top_k: int = 50,
+    causal: bool = False
+) -> nn.Module:
+    """Creates a sequence encoder of the specified type.
+
+    Args:
+        encoder_type: One of 'swiglu', 'transformer', or 'longer'.
+        d_model: Model dimension.
+        num_heads: Number of attention heads (used by transformer/longer).
+        hidden_mult: FFN expansion multiplier.
+        dropout: Dropout rate.
+        top_k: Compression length for LongerEncoder (only used by longer).
+        causal: Whether to use causal mask in LongerEncoder (only used by
+            longer).
+
+    Returns:
+        A sequence encoder module.
+    """
+    if encoder_type == 'swiglu':
+        return SwiGLUEncoder(d_model, hidden_mult, dropout)
+    elif encoder_type == 'transformer':
+        return TransformerEncoder(d_model, num_heads, hidden_mult, dropout)
+    elif encoder_type == 'longer':
+        return LongerEncoder(d_model, num_heads, top_k, hidden_mult, dropout, causal)
+    else:
+        raise ValueError(f"Unknown encoder type: {encoder_type}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HyFormer Blocks
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class MultiSeqHyFormerBlock(nn.Module):
+    """Multi-sequence HyFormer block.
+
+    Each of the S sequences independently performs Sequence Evolution and
+    Query Decoding, then all Q tokens and shared NS tokens are merged for
+    joint Query Boosting.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_queries: int,
+        num_ns: int,
+        num_sequences: int,
+        seq_encoder_type: str = 'swiglu',
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+        top_k: int = 50,
+        causal: bool = False,
+        rank_mixer_mode: str = 'full'
+    ) -> None:
+        super().__init__()
+        self.num_sequences = num_sequences
+        self.num_queries = num_queries
+        self.num_ns = num_ns
+
+        # Independent sequence encoder per sequence
+        self.seq_encoders = nn.ModuleList([
+            create_sequence_encoder(
+                encoder_type=seq_encoder_type,
+                d_model=d_model,
+                num_heads=num_heads,
+                hidden_mult=hidden_mult,
+                dropout=dropout,
+                top_k=top_k,
+                causal=causal
+            )
+            for _ in range(num_sequences)
+        ])
+
+        # Independent cross-attention per sequence
+        self.cross_attns = nn.ModuleList([
+            CrossAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                ln_mode='pre'
+            )
+            for _ in range(num_sequences)
+        ])
+
+        # RankMixer: input token count = Nq * S + Nns
+        n_total = num_queries * num_sequences + num_ns
+        self.mixer = RankMixerBlock(
+            d_model=d_model,
+            n_total=n_total,
+            hidden_mult=hidden_mult,
+            dropout=dropout,
+            mode=rank_mixer_mode
+        )
+
+    def forward(
+        self,
+        q_tokens_list: list,
+        ns_tokens: torch.Tensor,
+        seq_tokens_list: list,
+        seq_padding_masks: list,
+        rope_cos_list: Optional[List[torch.Tensor]] = None,
+        rope_sin_list: Optional[List[torch.Tensor]] = None,
+        return_decoded_qs: bool = False,
+    ) -> Tuple[list, torch.Tensor, list, list]:
+        """Processes one multi-sequence HyFormer block step.
+
+        Args:
+            q_tokens_list: List of (B, Nq, D) tensors, length S.
+            ns_tokens: (B, Nns, D)
+            seq_tokens_list: List of (B, L_i, D) tensors, length S.
+            seq_padding_masks: List of (B, L_i) masks, length S.
+            rope_cos_list: List of (1, L_i, head_dim) tensors, length S.
+            rope_sin_list: List of (1, L_i, head_dim) tensors, length S.
+            return_decoded_qs: Return decoded Q tensors before RankMixer.
+
+        Returns:
+            A tuple (next_q_list, next_ns, next_seq_list, next_masks), where
+            next_q_list is a list of (B, Nq, D) updated query tensors,
+            next_ns is (B, Nns, D) updated non-sequence tokens,
+            next_seq_list is a list of (B, L_i', D) encoded sequence tensors,
+            and next_masks is a list of (B, L_i') updated padding masks.
+        """
+        S = self.num_sequences
+        Nq = self.num_queries
+
+        # 1. Independent Sequence Evolution per sequence
+        next_seqs = []
+        next_masks = []
+        for i in range(S):
+            rc = rope_cos_list[i] if rope_cos_list is not None else None
+            rs = rope_sin_list[i] if rope_sin_list is not None else None
+            result = self.seq_encoders[i](
+                seq_tokens_list[i], seq_padding_masks[i],
+                rope_cos=rc, rope_sin=rs,
+            )
+            next_seq_i, mask_i = result
+            next_seqs.append(next_seq_i)
+            next_masks.append(mask_i)
+
+        # 2. Independent Query Decoding per sequence
+        decoded_qs = []
+        for i in range(S):
+            rc = rope_cos_list[i] if rope_cos_list is not None else None
+            rs = rope_sin_list[i] if rope_sin_list is not None else None
+            decoded_q_i = self.cross_attns[i](
+                q_tokens_list[i], next_seqs[i], next_masks[i],
+                rope_cos=rc, rope_sin=rs,
+            )
+            decoded_qs.append(decoded_q_i)
+
+        # 3. Token Fusion: concatenate all decoded_q + ns_tokens
+        combined = torch.cat(decoded_qs + [ns_tokens], dim=1)  # (B, Nq*S + Nns, D)
+
+        # 4. Query Boosting
+        boosted = self.mixer(combined)  # (B, Nq*S + Nns, D)
+
+        # 5. Split back into per-sequence Q and NS
+        next_q_list = []
+        offset = 0
+        for i in range(S):
+            next_q_list.append(boosted[:, offset:offset + Nq, :])
+            offset += Nq
+        next_ns = boosted[:, offset:, :]
+
+        if return_decoded_qs:
+            return next_q_list, next_ns, next_seqs, next_masks, decoded_qs
+
+        return next_q_list, next_ns, next_seqs, next_masks
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PCVRHyFormer Main Model
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class GroupNSTokenizer(nn.Module):
+    """NS tokenizer used by ns_tokenizer_type='group'.
+
+    Groups discrete features by fid, applies shared embedding with mean
+    pooling per multi-valued feature, then projects each group to a single
+    NS token (one token per group).
+    """
+
+    def __init__(self, feature_specs: List[Tuple[int, int, int]],
+                 groups: List[List[int]], emb_dim: int, d_model: int,
+                 emb_skip_threshold: int = 0) -> None:
+        super().__init__()
+        self.feature_specs = feature_specs
+        self.groups = groups
+        self.emb_dim = emb_dim
+        self.emb_skip_threshold = emb_skip_threshold
+
+        # One embedding table per fid (None if skipped by emb_skip_threshold
+        # or if vocab_size <= 0 / no vocab info).
+        embs = []
+        for vs, offset, length in feature_specs:
+            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+            if skip:
+                embs.append(None)
+            else:
+                embs.append(nn.Embedding(
+                    int(vs) + 1,
+                    emb_dim,
+                    padding_idx=0,
+                ))
+        self.embs = nn.ModuleList([e for e in embs if e is not None])
+        # Map from fid index to position in self.embs (or -1 if filtered)
+        self._emb_index = []
+        real_idx = 0
+        for e in embs:
+            if e is not None:
+                self._emb_index.append(real_idx)
+                real_idx += 1
+            else:
+                self._emb_index.append(-1)
+
+        # Per-group projection: num_fids_in_group * emb_dim -> d_model (with LayerNorm)
+        self.group_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(len(group) * emb_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for group in groups
+        ])
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Embeds and projects grouped discrete features into NS tokens.
+
+        Args:
+            int_feats: (B, total_int_dim), concatenated integer features.
+
+        Returns:
+            Tokens of shape (B, num_groups, D).
+        """
+        tokens = []
+        for group, proj in zip(self.groups, self.group_projs):
+            fid_embs = []
+            for fid_idx in group:
+                vs, offset, length = self.feature_specs[fid_idx]
+                emb_real_idx = self._emb_index[fid_idx]
+                if emb_real_idx == -1:
+                    # Filtered high-cardinality feature: output zero vector
+                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                else:
+                    emb_layer = self.embs[emb_real_idx]
+                    if length == 1:
+                        # Single-value feature: direct lookup
+                        fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
+                    else:
+                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
+                        vals = int_feats[:, offset:offset + length].long()  # (B, length)
+                        emb_all = emb_layer(vals)  # (B, length, emb_dim)
+                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
+                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
+                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                fid_embs.append(fid_emb)
+            cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
+            tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
+        return torch.cat(tokens, dim=1)  # (B, num_groups, D)
+
+
+class RankMixerNSTokenizer(nn.Module):
+    """NS Tokenizer following the RankMixer paper's approach.
+
+    All group embedding vectors are concatenated into a single long vector,
+    then equally split into num_ns_tokens segments, each projected to d_model.
+    This allows num_ns_tokens to be chosen freely (independent of group count).
+    """
+
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        groups: List[List[int]],
+        emb_dim: int,
+        d_model: int,
+        num_ns_tokens: int,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        """Initializes RankMixerNSTokenizer.
+
+        Args:
+            feature_specs: [(vocab_size, offset, length), ...] per feature.
+            groups: List of feature index groups (defines semantic ordering).
+            emb_dim: Embedding dimension per feature.
+            d_model: Output token dimension.
+            num_ns_tokens: Number of NS tokens to produce (T segments).
+            emb_skip_threshold: Skip embedding for features with vocab > threshold.
+        """
+        super().__init__()
+        self.feature_specs = feature_specs
+        self.groups = groups
+        self.emb_dim = emb_dim
+        self.num_ns_tokens = num_ns_tokens
+        self.emb_skip_threshold = emb_skip_threshold
+
+        # One embedding table per fid (None if skipped by emb_skip_threshold
+        # or if vocab_size <= 0 / no vocab info).
+        embs = []
+        for vs, offset, length in feature_specs:
+            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+            if skip:
+                embs.append(None)
+            else:
+                embs.append(nn.Embedding(
+                    int(vs) + 1,
+                    emb_dim,
+                    padding_idx=0,
+                ))
+        self.embs = nn.ModuleList([e for e in embs if e is not None])
+        # Map from fid index to position in self.embs (or -1 if filtered)
+        self._emb_index = []
+        real_idx = 0
+        for e in embs:
+            if e is not None:
+                self._emb_index.append(real_idx)
+                real_idx += 1
+            else:
+                self._emb_index.append(-1)
+
+        # Compute total embedding dim: sum of all fids across all groups
+        total_num_fids = sum(len(g) for g in groups)
+        total_emb_dim = total_num_fids * emb_dim
+
+        # Pad total_emb_dim to be divisible by num_ns_tokens
+        self.chunk_dim = math.ceil(total_emb_dim / num_ns_tokens)
+        self.padded_total_dim = self.chunk_dim * num_ns_tokens
+        self._pad_size = self.padded_total_dim - total_emb_dim
+
+        # Per-chunk projection: chunk_dim -> d_model with LayerNorm
+        self.token_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.chunk_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for _ in range(num_ns_tokens)
+        ])
+
+        logging.info(
+            f"RankMixerNSTokenizer: {total_num_fids} fids, "
+            f"total_emb_dim={total_emb_dim}, chunk_dim={self.chunk_dim}, "
+            f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
+        )
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Embeds all features, concatenates, splits, and projects.
+
+        Args:
+            int_feats: (B, total_int_dim) concatenated integer features.
+
+        Returns:
+            (B, num_ns_tokens, d_model) tensor.
+        """
+        # 1. Embed all fids in group order → flat cat
+        all_embs = []
+        for group in self.groups:
+            for fid_idx in group:
+                vs, offset, length = self.feature_specs[fid_idx]
+                emb_real_idx = self._emb_index[fid_idx]
+                if emb_real_idx == -1:
+                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                else:
+                    emb_layer = self.embs[emb_real_idx]
+                    if length == 1:
+                        fid_emb = emb_layer(int_feats[:, offset].long())
+                    else:
+                        vals = int_feats[:, offset:offset + length].long()
+                        emb_all = emb_layer(vals)
+                        mask = (vals != 0).float().unsqueeze(-1)
+                        count = mask.sum(dim=1).clamp(min=1)
+                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                all_embs.append(fid_emb)
+
+        cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
+
+        # 2. Pad if needed
+        if self._pad_size > 0:
+            cat_emb = F.pad(cat_emb, (0, self._pad_size))  # (B, padded_total_dim)
+
+        # 3. Split into num_ns_tokens chunks and project each
+        chunks = cat_emb.split(self.chunk_dim, dim=-1)  # list of (B, chunk_dim)
+        tokens = []
+        for chunk, proj in zip(chunks, self.token_projs):
+            tokens.append(F.silu(proj(chunk)).unsqueeze(1))  # (B, 1, d_model)
+
+        return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
+
+
+class PCVRHyFormer(nn.Module):
+    """PCVRHyFormer model for post-click conversion rate prediction.
+
+    Combines MultiSeqHyFormerBlock and MultiSeqQueryGenerator to process
+    multiple input sequences with non-sequence features.
+    """
+
+    def __init__(
+        self,
+        # Data schema
+        user_int_feature_specs: List[Tuple[int, int, int]],
+        item_int_feature_specs: List[Tuple[int, int, int]],
+        user_dense_dim: int,
+        item_dense_dim: int,
+        seq_vocab_sizes: "dict[str, List[int]]",  # {domain: [vocab_size_per_fid, ...]}
+        # NS grouping config (grouped by fid index)
+        user_ns_groups: List[List[int]],
+        item_ns_groups: List[List[int]],
+        user_dense_entries: Optional[List[Tuple[int, int, int]]] = None,
+        item_dense_entries: Optional[List[Tuple[int, int, int]]] = None,
+        # Model hyperparameters
+        d_model: int = 64,
+        emb_dim: int = 64,
+        num_queries: int = 1,
+        num_hyformer_blocks: int = 2,
+        num_heads: int = 4,
+        seq_encoder_type: str = 'transformer',
+        hidden_mult: int = 4,
+        dropout_rate: float = 0.01,
+        seq_top_k: int = 50,
+        seq_causal: bool = False,
+        action_num: int = 1,
+        num_time_buckets: int = 65,
+        num_weekday_buckets: int = 0,
+        num_hour_buckets: int = 0,
+        seq_time_stats_dim: int = 0,
+        rank_mixer_mode: str = 'full',
+        use_rope: bool = False,
+        rope_base: float = 10000.0,
+        emb_skip_threshold: int = 0,
+        seq_id_threshold: int = 10000,
+        # NS tokenizer variant
+        ns_tokenizer_type: str = 'rankmixer',
+        user_ns_tokens: int = 0,
+        item_ns_tokens: int = 0,
+        dense_tokenizer_type: str = 'single',
+        query_generator_type: str = 'baseline',
+        target_attn_type: str = 'none',
+        ui_shortcut_type: str = 'none',
+        ui_shortcut_alpha_init: float = 1.0,
+        first_decoded_shortcut_type: str = 'none',
+        first_decoded_detach: bool = False,
+        first_decoded_alpha_init: float = 0.01,
+        target_attn_alpha_init: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        self.d_model = d_model
+        self.emb_dim = emb_dim
+        self.action_num = action_num
+        self.num_queries = num_queries
+        self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
+        self.num_sequences = len(self.seq_domains)
+        self.num_time_buckets = num_time_buckets
+        self.num_weekday_buckets = num_weekday_buckets
+        self.num_hour_buckets = num_hour_buckets
+        self.seq_time_stats_dim = seq_time_stats_dim
+        self.rank_mixer_mode = rank_mixer_mode
+        self.use_rope = use_rope
+        self.emb_skip_threshold = emb_skip_threshold
+        self.seq_id_threshold = seq_id_threshold
+        self.ns_tokenizer_type = ns_tokenizer_type
+        self.dense_tokenizer_type = dense_tokenizer_type
+        self.query_generator_type = query_generator_type
+        self.target_attn_type = target_attn_type
+        self.ui_shortcut_type = ui_shortcut_type
+        self.ui_shortcut_alpha_init = ui_shortcut_alpha_init
+        self.first_decoded_shortcut_type = first_decoded_shortcut_type
+        self.first_decoded_detach = first_decoded_detach
+
+        # ================== NS Tokens Construction ==================
+
+        if ns_tokenizer_type == 'group':
+            # Original: one NS token per group
+            self.user_ns_tokenizer = GroupNSTokenizer(
+                feature_specs=user_int_feature_specs,
+                groups=user_ns_groups,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            num_user_ns = len(user_ns_groups)
+
+            self.item_ns_tokenizer = GroupNSTokenizer(
+                feature_specs=item_int_feature_specs,
+                groups=item_ns_groups,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            num_item_ns = len(item_ns_groups)
+        elif ns_tokenizer_type == 'rankmixer':
+            # RankMixer paper style: all embeddings cat → split → project
+            # 0 means auto: fall back to group count
+            if user_ns_tokens <= 0:
+                user_ns_tokens = len(user_ns_groups)
+            if item_ns_tokens <= 0:
+                item_ns_tokens = len(item_ns_groups)
+            self.user_ns_tokenizer = RankMixerNSTokenizer(
+                feature_specs=user_int_feature_specs,
+                groups=user_ns_groups,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_ns_tokens=user_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            num_user_ns = user_ns_tokens
+
+            self.item_ns_tokenizer = RankMixerNSTokenizer(
+                feature_specs=item_int_feature_specs,
+                groups=item_ns_groups,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_ns_tokens=item_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+            num_item_ns = item_ns_tokens
+        else:
+            raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
+
+        # User dense feature projection (if available)
+        self.has_user_dense = user_dense_dim > 0
+        if self.has_user_dense:
+            if dense_tokenizer_type == 'single':
+                self.user_dense_proj = nn.Sequential(
+                    nn.Linear(user_dense_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+            elif dense_tokenizer_type == 'field_attn':
+                self.user_dense_tokenizer = FieldAwareSingleDenseTokenizer(
+                    dense_entries=_normalize_dense_entries(
+                        user_dense_entries, user_dense_dim, 'user'
+                    ),
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    dropout=dropout_rate,
+                )
+            else:
+                raise ValueError(
+                    f"Unknown dense_tokenizer_type: {dense_tokenizer_type}"
+                )
+
+        # Item dense feature projection (if available)
+        self.has_item_dense = item_dense_dim > 0
+        if self.has_item_dense:
+            if dense_tokenizer_type == 'single':
+                self.item_dense_proj = nn.Sequential(
+                    nn.Linear(item_dense_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+            elif dense_tokenizer_type == 'field_attn':
+                self.item_dense_tokenizer = FieldAwareSingleDenseTokenizer(
+                    dense_entries=_normalize_dense_entries(
+                        item_dense_entries, item_dense_dim, 'item'
+                    ),
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    dropout=dropout_rate,
+                )
+            else:
+                raise ValueError(
+                    f"Unknown dense_tokenizer_type: {dense_tokenizer_type}"
+                )
+
+        # Total NS token count
+        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
+                       + num_item_ns + (1 if self.has_item_dense else 0))
+
+        # ================== Check d_model % T == 0 constraint (full mode only) ==================
+        T = num_queries * self.num_sequences + self.num_ns
+        if rank_mixer_mode == 'full' and d_model % T != 0:
+            valid_T_values = [t for t in range(1, d_model + 1) if d_model % t == 0]
+            raise ValueError(
+                f"d_model={d_model} must be divisible by T=num_queries*num_sequences+num_ns="
+                f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
+                f"Valid T values for d_model={d_model}: {valid_T_values}"
+            )
+
+        # ================== Seq Tokens Embedding ==================
+        # seq_id_threshold decides which features inside the seq tokenizer are
+        # treated as id features (they receive extra dropout). It is fully
+        # independent of emb_skip_threshold (which skips Embedding creation).
+        self.seq_id_emb_dropout = nn.Dropout(dropout_rate * 2)
+
+        def _make_seq_embs(vocab_sizes):
+            """Create embedding list, returning None for features skipped via
+            emb_skip_threshold or with no vocab info (vs<=0)."""
+            embs_raw = []
+            for vs in vocab_sizes:
+                skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+                if skip:
+                    embs_raw.append(None)
+                else:
+                    embs_raw.append(nn.Embedding(
+                        int(vs) + 1,
+                        emb_dim,
+                        padding_idx=0,
+                    ))
+            module_list = nn.ModuleList([e for e in embs_raw if e is not None])
+            # Map from position index to real index in module_list (-1 if skipped)
+            index_map = []
+            real_idx = 0
+            for e in embs_raw:
+                if e is not None:
+                    index_map.append(real_idx)
+                    real_idx += 1
+                else:
+                    index_map.append(-1)
+            is_id = [int(vs) > seq_id_threshold for vs in vocab_sizes]
+            return module_list, index_map, is_id
+
+        # ================== Dynamic Sequence Embeddings ==================
+        self._seq_embs = nn.ModuleDict()
+        self._seq_emb_index = {}    # domain -> index_map
+        self._seq_is_id = {}        # domain -> is_id list
+        self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
+        self._seq_proj = nn.ModuleDict()
+
+        for domain in self.seq_domains:
+            vs = seq_vocab_sizes[domain]
+            embs, idx_map, is_id = _make_seq_embs(vs)
+            self._seq_embs[domain] = embs
+            self._seq_emb_index[domain] = idx_map
+            self._seq_is_id[domain] = is_id
+            self._seq_vocab_sizes[domain] = vs
+            self._seq_proj[domain] = nn.Sequential(
+                nn.Linear(len(vs) * emb_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+
+        # ================== Time Interval Bucket Embedding (optional) ==================
+        if num_time_buckets > 0:
+            self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+
+        if num_weekday_buckets > 0:
+            self.weekday_embedding = nn.Embedding(num_weekday_buckets, d_model, padding_idx=0)
+
+        if num_hour_buckets > 0:
+            self.hour_embedding = nn.Embedding(num_hour_buckets, d_model, padding_idx=0)
+
+        # ================== HyFormer Components ==================
+        if query_generator_type == 'baseline':
+            self.query_generator = MultiSeqQueryGenerator(
+                d_model=d_model,
+                num_ns=self.num_ns,
+                num_queries=num_queries,
+                num_sequences=self.num_sequences,
+                hidden_mult=hidden_mult,
+                seq_time_stats_dim=seq_time_stats_dim,
+            )
+        elif query_generator_type == 'ui_aware':
+            self.query_generator = UserItemAwareQueryGenerator(
+                d_model=d_model,
+                num_queries=num_queries,
+                num_sequences=self.num_sequences,
+                num_heads=num_heads,
+                hidden_mult=hidden_mult,
+                dropout=dropout_rate,
+                seq_time_stats_dim=seq_time_stats_dim,
+            )
+        else:
+            raise ValueError(f"Unknown query_generator_type: {query_generator_type}")
+
+        if target_attn_type == 'none':
+            self.target_attn_branch = None
+            self.target_attn_gate = None
+            self.target_attn_alpha = None
+        elif target_attn_type == 'din':
+            self.target_attn_branch = DINTargetAttention(
+                d_model=d_model,
+                num_sequences=self.num_sequences,
+                hidden_mult=hidden_mult,
+                dropout=dropout_rate,
+            )
+            self.target_attn_gate = nn.Sequential(
+                nn.Linear(2 * d_model, d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model, d_model),
+            )
+            self.target_attn_alpha = nn.Parameter(
+                torch.ones(1) * float(target_attn_alpha_init)
+            )
+        else:
+            raise ValueError(f"Unknown target_attn_type: {target_attn_type}")
+
+        # MultiSeqHyFormerBlock stack
+        self.blocks = nn.ModuleList([
+            MultiSeqHyFormerBlock(
+                d_model=d_model,
+                num_heads=num_heads,
+                num_queries=num_queries,
+                num_ns=self.num_ns,
+                num_sequences=self.num_sequences,
+                seq_encoder_type=seq_encoder_type,
+                hidden_mult=hidden_mult,
+                dropout=dropout_rate,
+                top_k=seq_top_k,
+                causal=seq_causal,
+                rank_mixer_mode=rank_mixer_mode,
+            )
+            for _ in range(num_hyformer_blocks)
+        ])
+
+        # ================== RoPE ==================
+        if use_rope:
+            head_dim = d_model // num_heads
+            self.rotary_emb = RotaryEmbedding(dim=head_dim, base=rope_base)
+        else:
+            self.rotary_emb = None
+
+        # Output projection
+        self.output_proj = nn.Sequential(
+            nn.Linear(num_queries * self.num_sequences * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        if ui_shortcut_type == 'none':
+            self.ui_shortcut_tower = None
+            self.ui_residual_proj = None
+            self.ui_gate = None
+            self.ui_shortcut_alpha = None
+        elif ui_shortcut_type == 'bi_cross_attn':
+            self.ui_shortcut_tower = UserItemShortcutTower(
+                d_model=d_model,
+                num_heads=num_heads,
+                hidden_mult=hidden_mult,
+                dropout=dropout_rate,
+            )
+            self.ui_residual_proj = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+            )
+            self.ui_gate = nn.Linear(2 * d_model, d_model)
+            self.ui_shortcut_alpha = nn.Parameter(
+                torch.ones(1) * float(ui_shortcut_alpha_init)
+            )
+        else:
+            raise ValueError(f"Unknown ui_shortcut_type: {ui_shortcut_type}")
+
+        if first_decoded_shortcut_type != 'none':
+            self.first_decoded_branch = FirstDecodedQResidualBranch(
+                d_model=d_model,
+                num_queries=num_queries,
+                num_sequences=self.num_sequences,
+                hidden_mult=hidden_mult,
+                dropout=dropout_rate,
+                mode=first_decoded_shortcut_type,
+            )
+            self.first_decoded_gate = nn.Sequential(
+                nn.Linear(2 * d_model, d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model, d_model),
+            )
+            self.first_decoded_alpha = nn.Parameter(
+                torch.ones(1) * float(first_decoded_alpha_init)
+            )
+
+        # Dropout
+        self.emb_dropout = nn.Dropout(dropout_rate)
+
+        # Classifier
+        self.clsfier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(d_model, action_num)
+        )
+
+        # Initialize parameters
+        self._init_params()
+
+        # Log emb_skip_threshold filtering stats
+        if emb_skip_threshold > 0:
+            def _count_filtered(vocab_sizes, emb_index):
+                filtered = sum(1 for idx in emb_index if idx == -1)
+                return filtered, len(vocab_sizes)
+            for domain in self.seq_domains:
+                f, t = _count_filtered(self._seq_vocab_sizes[domain], self._seq_emb_index[domain])
+                if f > 0:
+                    logging.info(f"emb_skip_threshold={emb_skip_threshold}: {domain} skipped {f}/{t} features")
+            for name, tokenizer in [
+                ("user_ns", self.user_ns_tokenizer),
+                ("item_ns", self.item_ns_tokenizer),
+            ]:
+                f = sum(1 for idx in tokenizer._emb_index if idx == -1)
+                t = len(tokenizer._emb_index)
+                if f > 0:
+                    logging.info(f"emb_skip_threshold={emb_skip_threshold}: {name} skipped {f}/{t} features")
+
+    def _init_params(self) -> None:
+        """Applies Xavier initialization to all embedding weights."""
+        for domain in self.seq_domains:
+            for emb in self._seq_embs[domain]:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
+        for tokenizer in [self.user_ns_tokenizer, self.item_ns_tokenizer]:
+            for emb in tokenizer.embs:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
+        if self.num_time_buckets > 0:
+            nn.init.xavier_normal_(self.time_embedding.weight.data)
+            self.time_embedding.weight.data[0, :] = 0
+
+        if self.num_weekday_buckets > 0:
+            nn.init.xavier_normal_(self.weekday_embedding.weight.data)
+            self.weekday_embedding.weight.data[0, :] = 0
+
+        if self.num_hour_buckets > 0:
+            nn.init.xavier_normal_(self.hour_embedding.weight.data)
+            self.hour_embedding.weight.data[0, :] = 0
+
+    def reinit_high_cardinality_params(
+        self, cardinality_threshold: int = 10000
+    ) -> "set[int]":
+        """Reinitializes only high-cardinality embeddings.
+
+        Preserves low-cardinality and time feature embeddings.
+
+        Args:
+            cardinality_threshold: Only embeddings with vocab_size exceeding
+                this value are reinitialized.
+
+        Returns:
+            A set of data_ptr() values for reinitialized parameters.
+        """
+        reinit_count = 0
+        skip_count = 0
+        reinit_ptrs = set()
+
+        for emb_list, vocab_sizes, emb_index in [
+            (self._seq_embs[d], self._seq_vocab_sizes[d], self._seq_emb_index[d])
+            for d in self.seq_domains
+        ]:
+            for i, vs in enumerate(vocab_sizes):
+                real_idx = emb_index[i]
+                if real_idx == -1:
+                    # Skipped by emb_skip_threshold, no embedding to reinit
+                    continue
+                emb = emb_list[real_idx]
+                if int(vs) > cardinality_threshold:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
+                else:
+                    skip_count += 1
+
+        for tokenizer, specs in [
+            (self.user_ns_tokenizer, self.user_ns_tokenizer.feature_specs),
+            (self.item_ns_tokenizer, self.item_ns_tokenizer.feature_specs),
+        ]:
+            for i, (vs, offset, length) in enumerate(specs):
+                real_idx = tokenizer._emb_index[i]
+                if real_idx == -1:
+                    continue
+                emb = tokenizer.embs[real_idx]
+                if int(vs) > cardinality_threshold:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
+                else:
+                    skip_count += 1
+
+        # Time/calendar embeddings are always preserved.
+        if self.num_time_buckets > 0:
+            skip_count += 1
+        if self.num_weekday_buckets > 0:
+            skip_count += 1
+        if self.num_hour_buckets > 0:
+            skip_count += 1
+
+        logging.info(f"Re-initialized {reinit_count} feature Embeddings "
+                     f"(vocab>{cardinality_threshold}), kept {skip_count}")
+        return reinit_ptrs
+
+    def _build_calendar_context(
+        self,
+        weekday_ids: torch.Tensor,
+        hour_ids: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Build a sample-level calendar context vector from weekday/hour ids."""
+        context = None
+        if self.num_weekday_buckets > 0:
+            context = self.weekday_embedding(weekday_ids)
+        if self.num_hour_buckets > 0:
+            hour_context = self.hour_embedding(hour_ids)
+            context = hour_context if context is None else (context + hour_context)
+        return context
+
+    def get_sparse_params(self) -> List[nn.Parameter]:
+        """Returns all embedding table parameters (optimized with Adagrad)."""
+        sparse_params = set()
+        for module in self.modules():
+            if isinstance(module, nn.Embedding):
+                sparse_params.add(module.weight.data_ptr())
+        return [p for p in self.parameters() if p.data_ptr() in sparse_params]
+
+    def get_dense_params(self) -> List[nn.Parameter]:
+        """Returns all non-embedding parameters (optimized with AdamW)."""
+        sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
+        return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
+
+    def _embed_seq_domain(
+        self,
+        seq: torch.Tensor,
+        sideinfo_embs: nn.ModuleList,
+        proj: nn.Module,
+        is_id: List[bool],
+        emb_index: List[int],
+        time_bucket_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
+        B, S, L = seq.shape
+        emb_list = []
+        for i in range(S):
+            real_idx = emb_index[i] if i < len(emb_index) else -1
+            if real_idx == -1:
+                # Feature skipped by emb_skip_threshold: output zero vector
+                emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=torch.float))
+            else:
+                emb = sideinfo_embs[real_idx]
+                e = emb(seq[:, i, :])  # (B, L, emb_dim)
+                if is_id[i] and self.training:
+                    e = self.seq_id_emb_dropout(e)
+                emb_list.append(e)
+        cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
+        token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
+
+        # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
+        if self.num_time_buckets > 0:
+            token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        return token_emb
+
+    def _make_padding_mask(
+        self, seq_len: torch.Tensor, max_len: int
+    ) -> torch.Tensor:
+        """Generates a padding mask from sequence lengths."""
+        device = seq_len.device
+        idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
+        return idx >= seq_len.unsqueeze(1)  # (B, max_len)
+
+    def _run_multi_seq_blocks(
+        self,
+        q_tokens_list: list,
+        ns_tokens: torch.Tensor,
+        seq_tokens_list: list,
+        seq_masks_list: list,
+        apply_dropout: bool = True
+    ) -> Tuple[torch.Tensor, Optional[list]]:
+        """Runs the multi-sequence block stack with dropout and output projection."""
+        if apply_dropout:
+            q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
+            ns_tokens = self.emb_dropout(ns_tokens)
+            seq_tokens_list = [self.emb_dropout(s) for s in seq_tokens_list]
+
+        curr_qs = q_tokens_list
+        curr_ns = ns_tokens
+        curr_seqs = seq_tokens_list
+        curr_masks = seq_masks_list
+        first_decoded_qs = None
+
+        for layer_idx, block in enumerate(self.blocks):
+            # Precompute RoPE cos/sin for each sequence
+            rope_cos_list = None
+            rope_sin_list = None
+            if self.rotary_emb is not None:
+                rope_cos_list = []
+                rope_sin_list = []
+                device = curr_seqs[0].device
+                for seq_i in curr_seqs:
+                    seq_len = seq_i.shape[1]
+                    cos, sin = self.rotary_emb(seq_len, device)
+                    rope_cos_list.append(cos)
+                    rope_sin_list.append(sin)
+
+            capture_first_decoded = (
+                self.first_decoded_shortcut_type != 'none'
+                and layer_idx == 0
+            )
+            if capture_first_decoded:
+                curr_qs, curr_ns, curr_seqs, curr_masks, decoded_qs = block(
+                    q_tokens_list=curr_qs,
+                    ns_tokens=curr_ns,
+                    seq_tokens_list=curr_seqs,
+                    seq_padding_masks=curr_masks,
+                    rope_cos_list=rope_cos_list,
+                    rope_sin_list=rope_sin_list,
+                    return_decoded_qs=True,
+                )
+                first_decoded_qs = decoded_qs
+            else:
+                curr_qs, curr_ns, curr_seqs, curr_masks = block(
+                    q_tokens_list=curr_qs,
+                    ns_tokens=curr_ns,
+                    seq_tokens_list=curr_seqs,
+                    seq_padding_masks=curr_masks,
+                    rope_cos_list=rope_cos_list,
+                    rope_sin_list=rope_sin_list,
+                )
+
+        # Output: concatenate all sequences' Q tokens then project via MLP
+        B = curr_qs[0].shape[0]
+        all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
+        output = all_q.view(B, -1)  # (B, Nq*S*D)
+        output = self.output_proj(output)  # (B, D)
+
+        return output, first_decoded_qs
+
+    def _build_nonseq_tokens(
+        self,
+        inputs: ModelInput,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build user, item, and combined non-sequence tokens."""
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
+
+        user_parts = [user_ns]
+        if self.has_user_dense:
+            if self.dense_tokenizer_type == 'single':
+                user_dense_tok = F.silu(
+                    self.user_dense_proj(inputs.user_dense_feats)
+                ).unsqueeze(1)
+            else:
+                user_dense_tok = self.user_dense_tokenizer(
+                    inputs.user_dense_feats
+                )
+            user_parts.append(user_dense_tok)
+
+        item_parts = [item_ns]
+        if self.has_item_dense:
+            if self.dense_tokenizer_type == 'single':
+                item_dense_tok = F.silu(
+                    self.item_dense_proj(inputs.item_dense_feats)
+                ).unsqueeze(1)
+            else:
+                item_dense_tok = self.item_dense_tokenizer(
+                    inputs.item_dense_feats
+                )
+            item_parts.append(item_dense_tok)
+
+        user_tokens = torch.cat(user_parts, dim=1)
+        item_tokens = torch.cat(item_parts, dim=1)
+
+        calendar_context = self._build_calendar_context(
+            inputs.timestamp_weekday,
+            inputs.timestamp_hour,
+        )
+        if calendar_context is not None:
+            context = calendar_context.unsqueeze(1)
+            user_tokens = user_tokens + context
+            item_tokens = item_tokens + context
+
+        ns_tokens = torch.cat([user_tokens, item_tokens], dim=1)
+        return user_tokens, item_tokens, ns_tokens
+
+    def _apply_ui_shortcut(
+        self,
+        q_output: torch.Tensor,
+        user_tokens: torch.Tensor,
+        item_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse optional user-item shortcut into the final Q representation."""
+        if self.ui_shortcut_type == 'none':
+            return q_output
+
+        assert self.ui_shortcut_tower is not None
+        assert self.ui_residual_proj is not None
+        assert self.ui_gate is not None
+        assert self.ui_shortcut_alpha is not None
+
+        ui_repr = self.ui_shortcut_tower(user_tokens, item_tokens)
+        ui_residual = self.ui_residual_proj(ui_repr)
+        gate = torch.sigmoid(
+            self.ui_gate(torch.cat([q_output, ui_residual], dim=-1))
+        )
+        return q_output + self.ui_shortcut_alpha * gate * ui_residual
+
+    def _apply_first_decoded_shortcut(
+        self,
+        q_output: torch.Tensor,
+        first_decoded_qs: Optional[list],
+    ) -> torch.Tensor:
+        """Fuse first-block decoded Q evidence after the existing UI shortcut."""
+        if self.first_decoded_shortcut_type == 'none':
+            return q_output
+
+        if first_decoded_qs is None:
+            return q_output
+
+        if self.first_decoded_detach:
+            first_decoded_qs = [x.detach() for x in first_decoded_qs]
+
+        decode_residual = self.first_decoded_branch(first_decoded_qs)
+        gate = torch.sigmoid(
+            self.first_decoded_gate(
+                torch.cat([q_output, decode_residual], dim=-1)
+            )
+        )
+        return q_output + self.first_decoded_alpha * gate * decode_residual
+
+    def _apply_target_attention(
+        self,
+        q_output: torch.Tensor,
+        item_tokens: torch.Tensor,
+        seq_tokens_list: List[torch.Tensor],
+        seq_masks_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Fuse optional DIN-style target attention into the final representation."""
+        if self.target_attn_type == 'none':
+            return q_output
+
+        assert self.target_attn_branch is not None
+        assert self.target_attn_gate is not None
+        assert self.target_attn_alpha is not None
+
+        target_ctx = self.target_attn_branch(
+            item_tokens=item_tokens,
+            seq_tokens_list=seq_tokens_list,
+            seq_padding_masks=seq_masks_list,
+        )
+        gate = torch.sigmoid(
+            self.target_attn_gate(torch.cat([q_output, target_ctx], dim=-1))
+        )
+        return q_output + self.target_attn_alpha * gate * target_ctx
+
+    def forward(self, inputs: ModelInput) -> torch.Tensor:
+        """Runs the forward pass of the PCVRHyFormer model."""
+        # 1. NS tokens: user-side, item-side, and combined non-sequence tokens.
+        user_tokens, item_tokens, ns_tokens = self._build_nonseq_tokens(inputs)
+
+        # 2. Embed each sequence domain (dynamic)
+        seq_tokens_list = []
+        seq_masks_list = []
+        seq_time_stats_list = []
+        for domain in self.seq_domains:
+            tokens = self._embed_seq_domain(
+                inputs.seq_data[domain],
+                self._seq_embs[domain], self._seq_proj[domain],
+                self._seq_is_id[domain], self._seq_emb_index[domain],
+                inputs.seq_time_buckets[domain])
+            seq_tokens_list.append(tokens)
+            mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
+            seq_masks_list.append(mask)
+            seq_time_stats_list.append(inputs.seq_time_stats[domain])
+
+        # 3. Generate independent Q tokens per sequence.
+        if self.query_generator_type == 'baseline':
+            q_tokens_list = self.query_generator(
+                ns_tokens,
+                seq_tokens_list,
+                seq_masks_list,
+                seq_time_stats_list=seq_time_stats_list)
+        else:
+            q_tokens_list = self.query_generator(
+                user_tokens=user_tokens,
+                item_tokens=item_tokens,
+                seq_tokens_list=seq_tokens_list,
+                seq_padding_masks=seq_masks_list,
+                seq_time_stats_list=seq_time_stats_list,
+            )
+
+        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
+        output, first_decoded_qs = self._run_multi_seq_blocks(
+            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            apply_dropout=self.training
+        )
+        output = self._apply_ui_shortcut(output, user_tokens, item_tokens)
+        output = self._apply_first_decoded_shortcut(output, first_decoded_qs)
+        output = self._apply_target_attention(
+            output, item_tokens, seq_tokens_list, seq_masks_list)
+
+        # 5. Classifier
+        logits = self.clsfier(output)  # (B, action_num)
+        return logits
+
+    def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Runs inference without dropout, returning both logits and embeddings."""
+        # Reuses forward logic but without the initial embedding dropout.
+        user_tokens, item_tokens, ns_tokens = self._build_nonseq_tokens(inputs)
+
+        seq_tokens_list = []
+        seq_masks_list = []
+        seq_time_stats_list = []
+        for domain in self.seq_domains:
+            tokens = self._embed_seq_domain(
+                inputs.seq_data[domain],
+                self._seq_embs[domain], self._seq_proj[domain],
+                self._seq_is_id[domain], self._seq_emb_index[domain],
+                inputs.seq_time_buckets[domain])
+            seq_tokens_list.append(tokens)
+            mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
+            seq_masks_list.append(mask)
+            seq_time_stats_list.append(inputs.seq_time_stats[domain])
+
+        if self.query_generator_type == 'baseline':
+            q_tokens_list = self.query_generator(
+                ns_tokens,
+                seq_tokens_list,
+                seq_masks_list,
+                seq_time_stats_list=seq_time_stats_list)
+        else:
+            q_tokens_list = self.query_generator(
+                user_tokens=user_tokens,
+                item_tokens=item_tokens,
+                seq_tokens_list=seq_tokens_list,
+                seq_padding_masks=seq_masks_list,
+                seq_time_stats_list=seq_time_stats_list,
+            )
+
+        output, first_decoded_qs = self._run_multi_seq_blocks(
+            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            apply_dropout=False
+        )
+        output = self._apply_ui_shortcut(output, user_tokens, item_tokens)
+        output = self._apply_first_decoded_shortcut(output, first_decoded_qs)
+        output = self._apply_target_attention(
+            output, item_tokens, seq_tokens_list, seq_masks_list)
+
+        logits = self.clsfier(output)
+        return logits, output
